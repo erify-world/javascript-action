@@ -1,0 +1,123 @@
+name: ERIFY CI/CD 💎🔥
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+# Prevent duplicate runs on rapid pushes to same ref
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Build & Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]   # LTS + current
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: 🔐 Use .npmrc if present
+        if: hashFiles('.npmrc') != ''
+        run: echo ".npmrc detected"
+
+      - name: 📦 Install (prefer lockfile)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: 🔍 Lint (if script exists)
+        run: npm run lint --if-present
+
+      - name: 🧹 Prettier check (optional)
+        run: npx prettier --version && npx prettier --check .
+        continue-on-error: true
+
+      - name: 🧪 Tests (if present)
+        run: npm test --if-present --silent
+        env:
+          CI: true
+
+      - name: 📦 Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-node-${{ matrix.node }}
+          path: |
+            npm-debug.log*
+            **/jest-*.html
+            **/junit*.xml
+            **/coverage/**
+          if-no-files-found: ignore
+
+  auto-label:
+    name: PR Auto Labels
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: 🚧 Label PR as In Progress
+        if: github.event_name == 'pull_request' && contains('opened,reopened,synchronize', github.event.action)
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          labels: "🚧 In Progress"
+
+      - name: ✅ Label PR as Done (merged)
+        if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+        uses: actions-ecosystem/action-add-labels@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          labels: "✅ Done"
+
+  # OPTIONAL: move linked issue in your GitHub Project to Done on merge
+  # Set secrets: ORG (e.g. erify-world), PROJECT_NUMBER, GH_TOKEN (classic PAT with project write)
+  project-sync:
+    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    needs: [build-test]
+    steps:
+      - name: 🔄 Sync Project item to Done (optional)
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          ORG: ${{ secrets.ORG }}
+          PROJECT_NUMBER: ${{ secrets.PROJECT_NUMBER }}
+        run: |
+          if [ -z "$GH_TOKEN" ] || [ -z "$ORG" ] || [ -z "$PROJECT_NUMBER" ]; then
+            echo "Project sync skipped (secrets not set)."; exit 0;
+          fi
+          # Find issues linked to this PR and move them to "Done"
+          PR_URL="${{ github.event.pull_request.html_url }}"
+          ISSUE_NUMBERS=$(gh pr view "$PR_URL" --json closingIssuesReferences --jq '.closingIssuesReferences[].number')
+          if [ -z "$ISSUE_NUMBERS" ]; then
+            echo "No linked issues found. Skipping."; exit 0;
+          fi
+          for N in $ISSUE_NUMBERS; do
+            echo "Syncing issue #$N to Done…"
+            # Add to project if missing, then set status=Done (requires a field named 'Status')
+            gh project item-add --owner "$ORG" --project-number "$PROJECT_NUMBER" --url "https://github.com/${{ github.repository }}/issues/$N" || true
+            # Get field id for Status and option id for Done
+            STATUS_FIELD_ID=$(gh project field-list "$PROJECT_NUMBER" --owner "$ORG" --format json | jq -r '.[] | select(.name=="Status").id')
+            DONE_OPTION_ID=$(gh project field-list "$PROJECT_NUMBER" --owner "$ORG" --format json | jq -r '.[] | select(.name=="Status").settings.options[] | select(.name=="✅ Done").id')
+            ITEM_ID=$(gh project item-list "$PROJECT_NUMBER" --owner "$ORG" --format json --filter "url:https://github.com/${{ github.repository }}/issues/$N" | jq -r '.[0].id')
+            if [ -n "$STATUS_FIELD_ID" ] && [ -n "$DONE_OPTION_ID" ] && [ -n "$ITEM_ID" ]; then
+              gh project item-update --owner "$ORG" --project-number "$PROJECT_NUMBER" --id "$ITEM_ID" --field-id "$STATUS_FIELD_ID" --single-select-option-id "$DONE_OPTION_ID"
+            else
+              echo "Could not resolve fields/options; ensure Status and ✅ Done exist."
+            fi
+          done
